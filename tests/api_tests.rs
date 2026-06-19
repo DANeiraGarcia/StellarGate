@@ -10,19 +10,23 @@ async fn test_server() -> TestServer {
     let cfg = Config {
         port: 0,
         database_url: "sqlite::memory:".into(),
+        network: "testnet".into(),
         horizon_url: String::new(),
         gateway_public: "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5".into(),
+        gateway_secret: String::new(),
         usdc_issuer: String::new(),
         webhook_secret: String::new(),
         webhook_retry_attempts: 1,
         webhook_retry_delay_ms: 0,
+        poll_interval_secs: 10,
     };
     let pool = SqlitePoolOptions::new()
         .connect_with(SqliteConnectOptions::from_str(&cfg.database_url).unwrap().create_if_missing(true))
         .await
         .unwrap();
     db::migrate(&pool).await.unwrap();
-    TestServer::new(api::router(Arc::new(AppState { pool, config: cfg }))).unwrap()
+    let http = reqwest::Client::new();
+    TestServer::new(api::router(Arc::new(AppState { pool, config: cfg, http }))).unwrap()
 }
 
 #[tokio::test]
@@ -79,4 +83,73 @@ async fn test_get_by_id() {
 async fn test_get_not_found() {
     let res = test_server().await.get("/payments/does-not-exist").await;
     res.assert_status(StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn test_reject_too_many_decimals() {
+    let res = test_server().await
+        .post("/payments")
+        .json(&json!({ "amount": "1.00000001", "asset": "XLM" }))
+        .await;
+    res.assert_status(StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn test_asset_is_case_insensitive() {
+    let res = test_server().await
+        .post("/payments")
+        .json(&json!({ "amount": "1", "asset": "usdc" }))
+        .await;
+    res.assert_status(StatusCode::CREATED);
+    assert_eq!(res.json::<Value>()["asset"], "USDC");
+}
+
+#[tokio::test]
+async fn test_reject_bad_webhook_url() {
+    let res = test_server().await
+        .post("/payments")
+        .json(&json!({ "amount": "1", "asset": "XLM", "webhook_url": "ftp://x" }))
+        .await;
+    res.assert_status(StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn test_list_payments() {
+    let server = test_server().await;
+    for amt in ["1", "2", "3"] {
+        server.post("/payments").json(&json!({ "amount": amt, "asset": "XLM" })).await;
+    }
+
+    let res = server.get("/payments").await;
+    res.assert_status_ok();
+    let body: Value = res.json();
+    assert_eq!(body["total"], 3);
+    assert_eq!(body["payments"].as_array().unwrap().len(), 3);
+}
+
+#[tokio::test]
+async fn test_list_filter_by_status() {
+    let server = test_server().await;
+    server.post("/payments").json(&json!({ "amount": "1", "asset": "XLM" })).await;
+
+    // All created payments start pending, so completed should be empty.
+    let res = server.get("/payments?status=completed").await;
+    res.assert_status_ok();
+    assert_eq!(res.json::<Value>()["total"], 0);
+
+    let res = server.get("/payments?status=pending").await;
+    assert_eq!(res.json::<Value>()["total"], 1);
+}
+
+#[tokio::test]
+async fn test_list_invalid_status() {
+    let res = test_server().await.get("/payments?status=bogus").await;
+    res.assert_status(StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn test_unknown_route_returns_json_404() {
+    let res = test_server().await.get("/nope").await;
+    res.assert_status(StatusCode::NOT_FOUND);
+    assert_eq!(res.json::<Value>()["error"], "not found");
 }

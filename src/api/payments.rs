@@ -1,6 +1,6 @@
-use crate::{db, AppState};
+use crate::{db, money, AppState};
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     Json,
@@ -10,19 +10,40 @@ use serde_json::{json, Value};
 use std::sync::Arc;
 use uuid::Uuid;
 
-pub struct AppError(StatusCode, &'static str);
+/// An error with an HTTP status and a JSON-serializable message.
+pub struct AppError {
+    status: StatusCode,
+    message: String,
+}
+
+impl AppError {
+    fn new(status: StatusCode, message: impl Into<String>) -> Self {
+        Self {
+            status,
+            message: message.into(),
+        }
+    }
+
+    fn bad_request(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::BAD_REQUEST, message)
+    }
+}
 
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
-        (self.0, Json(json!({ "error": self.1 }))).into_response()
+        (self.status, Json(json!({ "error": self.message }))).into_response()
     }
 }
 
 impl From<anyhow::Error> for AppError {
-    fn from(_: anyhow::Error) -> Self {
-        AppError(StatusCode::INTERNAL_SERVER_ERROR, "internal server error")
+    fn from(err: anyhow::Error) -> Self {
+        // Log the real cause; never leak internals to the client.
+        tracing::error!(error = %err, "internal error");
+        AppError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal server error")
     }
 }
+
+const SUPPORTED_ASSETS: [&str; 2] = ["XLM", "USDC"];
 
 #[derive(Deserialize)]
 pub struct CreatePaymentRequest {
@@ -33,17 +54,31 @@ pub struct CreatePaymentRequest {
     pub webhook_url: Option<String>,
 }
 
-fn default_asset() -> String { "XLM".into() }
+fn default_asset() -> String {
+    "XLM".into()
+}
 
 pub async fn create(
     State(state): State<Arc<AppState>>,
     Json(body): Json<CreatePaymentRequest>,
 ) -> Result<(StatusCode, Json<Value>), AppError> {
-    if !["XLM", "USDC"].contains(&body.asset.as_str()) {
-        return Err(AppError(StatusCode::BAD_REQUEST, "unsupported asset"));
+    let asset = body.asset.to_uppercase();
+    if !SUPPORTED_ASSETS.contains(&asset.as_str()) {
+        return Err(AppError::bad_request(format!(
+            "unsupported asset '{}'; supported: {}",
+            body.asset,
+            SUPPORTED_ASSETS.join(", ")
+        )));
     }
-    if body.amount.parse::<f64>().unwrap_or(0.0) <= 0.0 {
-        return Err(AppError(StatusCode::BAD_REQUEST, "invalid amount"));
+    if !money::is_valid_amount(&body.amount) {
+        return Err(AppError::bad_request(
+            "amount must be a positive number with at most 7 decimal places",
+        ));
+    }
+    if let Some(url) = &body.webhook_url {
+        if !(url.starts_with("http://") || url.starts_with("https://")) {
+            return Err(AppError::bad_request("webhook_url must be an http(s) URL"));
+        }
     }
 
     let memo = generate_unique_memo(&state.pool).await?;
@@ -51,13 +86,15 @@ pub async fn create(
 
     let payment = db::create_payment(
         &state.pool,
-        &id,
-        body.merchant_id.as_deref().unwrap_or("anonymous"),
-        &state.config.gateway_public,
-        &memo,
-        &body.amount,
-        &body.asset,
-        body.webhook_url.as_deref(),
+        db::NewPayment {
+            id: &id,
+            merchant_id: body.merchant_id.as_deref().unwrap_or("anonymous"),
+            destination_address: &state.config.gateway_public,
+            memo: &memo,
+            amount: &body.amount,
+            asset: &asset,
+            webhook_url: body.webhook_url.as_deref(),
+        },
     )
     .await?;
 
@@ -70,8 +107,47 @@ pub async fn get_by_id(
 ) -> Result<Json<Value>, AppError> {
     match db::get_payment(&state.pool, &id).await? {
         Some(p) => Ok(Json(to_json(&p))),
-        None => Err(AppError(StatusCode::NOT_FOUND, "payment not found")),
+        None => Err(AppError::new(StatusCode::NOT_FOUND, "payment not found")),
     }
+}
+
+#[derive(Deserialize)]
+pub struct ListQuery {
+    pub status: Option<String>,
+    pub limit: Option<i64>,
+    pub offset: Option<i64>,
+}
+
+const DEFAULT_LIMIT: i64 = 20;
+const MAX_LIMIT: i64 = 100;
+const VALID_STATUSES: [&str; 3] = ["pending", "completed", "failed"];
+
+pub async fn list(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<ListQuery>,
+) -> Result<Json<Value>, AppError> {
+    if let Some(s) = &q.status {
+        if !VALID_STATUSES.contains(&s.as_str()) {
+            return Err(AppError::bad_request(format!(
+                "invalid status '{}'; valid: {}",
+                s,
+                VALID_STATUSES.join(", ")
+            )));
+        }
+    }
+
+    let limit = q.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
+    let offset = q.offset.unwrap_or(0).max(0);
+
+    let (payments, total) =
+        db::list_payments(&state.pool, q.status.as_deref(), limit, offset).await?;
+
+    Ok(Json(json!({
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+        "payments": payments.iter().map(to_json).collect::<Vec<_>>(),
+    })))
 }
 
 async fn generate_unique_memo(pool: &db::Db) -> Result<String, AppError> {
@@ -81,17 +157,24 @@ async fn generate_unique_memo(pool: &db::Db) -> Result<String, AppError> {
             return Ok(memo);
         }
     }
-    Err(AppError(StatusCode::INTERNAL_SERVER_ERROR, "memo generation failed"))
+    Err(AppError::new(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "memo generation failed",
+    ))
 }
 
 fn to_json(p: &db::Payment) -> Value {
     json!({
         "id": p.id,
+        "merchant_id": p.merchant_id,
         "destination_address": p.destination_address,
         "memo": p.memo,
         "amount": p.amount,
         "asset": p.asset,
         "status": p.status,
+        "tx_hash": p.tx_hash,
+        "paid_amount": p.paid_amount,
         "created_at": p.created_at,
+        "updated_at": p.updated_at,
     })
 }

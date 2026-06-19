@@ -1,31 +1,75 @@
-use stellargate::{api, config::Config, db, AppState};
 use anyhow::Result;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use std::str::FromStr;
 use std::sync::Arc;
+use std::time::Duration;
+use stellargate::{api, config::Config, db, horizon, AppState};
 use tracing::info;
+use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt::init();
+    tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
+        .init();
     dotenvy::dotenv().ok();
 
     let cfg = Config::from_env()?;
 
     let pool = SqlitePoolOptions::new()
-        .connect_with(
-            SqliteConnectOptions::from_str(&cfg.database_url)?.create_if_missing(true),
-        )
+        .connect_with(SqliteConnectOptions::from_str(&cfg.database_url)?.create_if_missing(true))
         .await?;
-
     db::migrate(&pool).await?;
 
-    let state = Arc::new(AppState { pool, config: cfg.clone() });
+    let http = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .user_agent(concat!("StellarGate/", env!("CARGO_PKG_VERSION")))
+        .build()?;
+
+    let state = Arc::new(AppState {
+        pool,
+        config: cfg.clone(),
+        http,
+    });
+
+    // Background reconciliation of pending payments against Horizon.
+    tokio::spawn(horizon::run_poller(state.clone()));
+
     let addr = format!("0.0.0.0:{}", cfg.port);
+    let listener = tokio::net::TcpListener::bind(&addr).await?;
     info!("StellarGate API listening on {addr}");
 
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
-    axum::serve(listener, api::router(state)).await?;
+    axum::serve(listener, api::router(state))
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
 
+    info!("shutdown complete");
     Ok(())
+}
+
+/// Resolves when the process receives Ctrl-C (or SIGTERM on Unix), letting axum
+/// drain in-flight requests before exiting.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl-C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to install SIGTERM handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
+    info!("shutdown signal received");
 }

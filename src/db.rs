@@ -81,31 +81,33 @@ fn row_to_payment(row: &sqlx::sqlite::SqliteRow) -> Payment {
     }
 }
 
-pub async fn create_payment(
-    pool: &Db,
-    id: &str,
-    merchant_id: &str,
-    destination_address: &str,
-    memo: &str,
-    amount: &str,
-    asset: &str,
-    webhook_url: Option<&str>,
-) -> Result<Payment> {
+/// Fields needed to insert a new payment intent.
+pub struct NewPayment<'a> {
+    pub id: &'a str,
+    pub merchant_id: &'a str,
+    pub destination_address: &'a str,
+    pub memo: &'a str,
+    pub amount: &'a str,
+    pub asset: &'a str,
+    pub webhook_url: Option<&'a str>,
+}
+
+pub async fn create_payment(pool: &Db, new: NewPayment<'_>) -> Result<Payment> {
     sqlx::query(
         "INSERT INTO payments (id, merchant_id, destination_address, memo, amount, asset, webhook_url)
          VALUES (?, ?, ?, ?, ?, ?, ?)",
     )
-    .bind(id)
-    .bind(merchant_id)
-    .bind(destination_address)
-    .bind(memo)
-    .bind(amount)
-    .bind(asset)
-    .bind(webhook_url)
+    .bind(new.id)
+    .bind(new.merchant_id)
+    .bind(new.destination_address)
+    .bind(new.memo)
+    .bind(new.amount)
+    .bind(new.asset)
+    .bind(new.webhook_url)
     .execute(pool)
     .await?;
 
-    get_payment(pool, id)
+    get_payment(pool, new.id)
         .await?
         .ok_or_else(|| anyhow::anyhow!("Payment not found after insert"))
 }
@@ -166,6 +168,20 @@ pub async fn list_payments(
     };
 
     Ok((rows.iter().map(row_to_payment).collect(), total))
+}
+
+/// All payments still awaiting confirmation, oldest first. Used by the Horizon
+/// poller to decide which memos to watch for on-chain.
+pub async fn list_pending(pool: &Db) -> Result<Vec<Payment>> {
+    let rows = sqlx::query(
+        "SELECT id, merchant_id, destination_address, memo, amount, asset, status,
+                webhook_url, tx_hash, paid_amount, created_at, updated_at
+         FROM payments WHERE status = 'pending' ORDER BY created_at ASC",
+    )
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows.iter().map(row_to_payment).collect())
 }
 
 pub async fn find_pending_by_memo(pool: &Db, memo: &str) -> Result<Option<Payment>> {

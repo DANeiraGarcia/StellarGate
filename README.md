@@ -21,14 +21,15 @@ This project is under active development. The following is implemented:
 
 - [x] `POST /payments` — create a payment intent
 - [x] `GET /payments/:id` — query payment status
+- [x] `GET /payments` — list & filter payments (pagination)
 - [x] `GET /health` — health check
 - [x] SQLite persistence
-- [x] Input validation (asset, amount)
-- [ ] Transaction listener (Horizon streaming)
-- [ ] Payment verification
-- [ ] Webhook dispatch
-- [ ] List/filter payments
-- [ ] Multi-merchant support
+- [x] Input validation (asset, amount as exact stroops, webhook URL)
+- [x] Transaction listener (Horizon polling)
+- [x] Payment verification (memo + asset + amount)
+- [x] Webhook dispatch (HMAC-SHA256 signed, with retries)
+- [x] Multi-merchant support (`merchant_id` per payment)
+- [ ] Horizon streaming (currently polled on an interval)
 - [ ] Dashboard UI
 
 ## Tech Stack
@@ -60,12 +61,19 @@ cp .env.example .env
 | Variable | Description | Default |
 |---|---|---|
 | `PORT` | HTTP port | `3000` |
-| `DATABASE_URL` | SQLite path | `sqlite:stellargate.db` |
+| `DATABASE_URL` | sqlx connection string | `sqlite:stellargate.db` |
+| `STELLAR_NETWORK` | `testnet` or `public` | `testnet` |
 | `STELLAR_HORIZON_URL` | Horizon endpoint | testnet |
 | `STELLAR_GATEWAY_PUBLIC` | Your gateway wallet public key | — |
 | `STELLAR_GATEWAY_SECRET` | Your gateway wallet secret key | — |
 | `USDC_ISSUER` | USDC issuer address | testnet issuer |
+| `POLL_INTERVAL_SECS` | How often the Horizon poller reconciles | `10` |
 | `WEBHOOK_SECRET` | HMAC signing secret for webhooks | — |
+| `WEBHOOK_RETRY_ATTEMPTS` | Webhook delivery attempts | `3` |
+| `WEBHOOK_RETRY_DELAY_MS` | Delay between webhook retries | `5000` |
+
+> `DATABASE_URL` is a sqlx connection string (`sqlite:stellargate.db`), not a
+> file path. The Horizon poller stays idle until `STELLAR_GATEWAY_PUBLIC` is set.
 
 ### Run
 
@@ -79,7 +87,8 @@ cargo run
 cargo test
 ```
 
-All 6 tests should pass.
+Tests cover amount/stroops handling, Horizon payment verification, webhook
+signing, and the HTTP API (create, fetch, list/filter, validation).
 
 ## API Reference
 
@@ -129,6 +138,7 @@ Fetch the current status of a payment.
 ```json
 {
   "id": "a1b2c3d4-...",
+  "merchant_id": "your-merchant-id",
   "destination_address": "GBBD47IF6LWK7P7...",
   "memo": "A1B2C3D4",
   "amount": "10.00",
@@ -136,7 +146,8 @@ Fetch the current status of a payment.
   "status": "pending",
   "tx_hash": null,
   "paid_amount": null,
-  "created_at": "2026-04-29T15:00:00"
+  "created_at": "2026-04-29T15:00:00",
+  "updated_at": "2026-04-29T15:00:00"
 }
 ```
 
@@ -150,10 +161,34 @@ Fetch the current status of a payment.
 
 ---
 
+### `GET /payments`
+
+List payments, newest first.
+
+**Query parameters**
+
+| Param | Description | Default |
+|---|---|---|
+| `status` | Filter by `pending`, `completed`, or `failed` | all |
+| `limit` | Page size (1–100) | `20` |
+| `offset` | Rows to skip | `0` |
+
+**Response** `200 OK`
+```json
+{
+  "total": 42,
+  "limit": 20,
+  "offset": 0,
+  "payments": [ { "id": "...", "status": "pending", "...": "..." } ]
+}
+```
+
+---
+
 ### `GET /health`
 
-```
-200 OK — "ok"
+```json
+200 OK — { "status": "ok" }
 ```
 
 ## Payment Flow
@@ -168,7 +203,7 @@ Fetch the current status of a payment.
 7. POSTs webhook event to developer's webhook_url
 ```
 
-## Webhook Events *(coming soon)*
+## Webhook Events
 
 ```json
 {
@@ -187,13 +222,16 @@ Webhooks are signed with `X-StellarGate-Signature` (HMAC-SHA256) so you can veri
 
 ```
 src/
-├── main.rs          # Entry point, server startup
+├── main.rs          # Entry point, server startup, poller spawn, graceful shutdown
 ├── lib.rs           # Shared state and module exports
 ├── config.rs        # Environment configuration
 ├── db.rs            # Database queries (SQLite)
+├── money.rs         # Stroops-based amount parsing/validation
+├── horizon.rs       # Horizon polling listener + payment verification
+├── webhook.rs       # HMAC-SHA256 signed webhook dispatch
 └── api/
-    ├── mod.rs       # Axum router
-    └── payments.rs  # Payment handlers
+    ├── mod.rs       # Axum router, layers (CORS/trace/body-limit), 404 fallback
+    └── payments.rs  # Payment handlers (create, get, list)
 
 tests/
 └── api_tests.rs     # Integration tests
