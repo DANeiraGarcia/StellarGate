@@ -30,6 +30,7 @@ This project is under active development. The following is implemented:
 - [x] Webhook dispatch (HMAC-SHA256 signed, with retries)
 - [x] Multi-merchant support (`merchant_id` per payment)
 - [x] Horizon streaming (SSE, with polling as a reconciler)
+- [x] Rate limiting (per-IP, configurable)
 - [ ] Dashboard UI
 
 ## Tech Stack
@@ -73,6 +74,7 @@ cp .env.example .env
 | `WEBHOOK_RETRY_ATTEMPTS` | Webhook delivery attempts | `3` |
 | `WEBHOOK_RETRY_DELAY_MS` | Delay between webhook retries | `5000` |
 | `CORS_ALLOWED_ORIGINS` | Comma-separated allowed CORS origins (e.g. `https://app.example.com`). Required on `public` network; omitting on testnet falls back to permissive with a warning. | _(unset — permissive on testnet)_ |
+| `RATE_LIMIT_REQUESTS_PER_SEC` | Rate limit for `POST /payments` (requests per second per IP) | `10` |
 
 > `DATABASE_URL` is a sqlx connection string (`sqlite:stellargate.db`), not a
 > file path. The Horizon poller stays idle until `STELLAR_GATEWAY_PUBLIC` is set.
