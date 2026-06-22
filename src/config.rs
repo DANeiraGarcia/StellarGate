@@ -36,7 +36,7 @@ pub struct AcceptedAsset {
 }
 
 impl AcceptedAsset {
-    fn parse_list(raw: &str) -> Vec<Self> {
+    pub(crate) fn parse_list(raw: &str) -> Vec<Self> {
         raw.split(',')
             .map(str::trim)
             .filter(|s| !s.is_empty())
@@ -58,18 +58,19 @@ impl AcceptedAsset {
 
     pub fn default_list() -> Vec<Self> {
         vec![
-            AcceptedAsset { code: "XLM".into(), issuer: None },
+            AcceptedAsset {
+                code: "XLM".into(),
+                issuer: None,
+            },
             AcceptedAsset {
                 code: "USDC".into(),
-                issuer: Some(
-                    "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5".into(),
-                ),
+                issuer: Some("GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5".into()),
             },
         ]
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct Config {
     pub port: u16,
     pub database_url: String,
@@ -91,6 +92,8 @@ pub struct Config {
     /// Required when `STELLAR_NETWORK=public`; optional (falls back to permissive) on testnet.
     pub cors_allowed_origins: Vec<String>,
     pub listener_mode: ListenerMode,
+    /// Rate limit for `POST /payments` (requests per second per IP).
+    pub rate_limit_requests_per_sec: u32,
 }
 
 impl Config {
@@ -125,6 +128,7 @@ impl Config {
             listener_mode: ListenerMode::parse(
                 &std::env::var("STELLAR_LISTENER_MODE").unwrap_or_default(),
             ),
+            rate_limit_requests_per_sec: parse_env("RATE_LIMIT_REQUESTS_PER_SEC", 10),
         })
     }
 
@@ -151,6 +155,10 @@ impl std::fmt::Debug for Config {
             .field("poll_interval_secs", &self.poll_interval_secs)
             .field("cors_allowed_origins", &self.cors_allowed_origins)
             .field("listener_mode", &self.listener_mode)
+            .field(
+                "rate_limit_requests_per_sec",
+                &self.rate_limit_requests_per_sec,
+            )
             .finish()
     }
 }
@@ -176,20 +184,48 @@ mod tests {
             payment_ttl_secs: 3600,
             cors_allowed_origins: vec![],
             listener_mode: ListenerMode::Stream,
+            rate_limit_requests_per_sec: 10,
         };
         let output = format!("{cfg:?}");
-        assert!(!output.contains("super-secret-key"), "gateway_secret must not appear in Debug output");
-        assert!(!output.contains("webhook-hmac-secret"), "webhook_secret must not appear in Debug output");
-        assert!(output.contains("***"), "redacted marker must appear in Debug output");
+        assert!(
+            !output.contains("super-secret-key"),
+            "gateway_secret must not appear in Debug output"
+        );
+        assert!(
+            !output.contains("webhook-hmac-secret"),
+            "webhook_secret must not appear in Debug output"
+        );
+        assert!(
+            output.contains("***"),
+            "redacted marker must appear in Debug output"
+        );
     }
 
     #[test]
     fn parse_accepted_assets_from_env_string() {
         let assets = AcceptedAsset::parse_list("XLM,USDC:GISSUER,EURC:GISSUER2");
         assert_eq!(assets.len(), 3);
-        assert_eq!(assets[0], AcceptedAsset { code: "XLM".into(), issuer: None });
-        assert_eq!(assets[1], AcceptedAsset { code: "USDC".into(), issuer: Some("GISSUER".into()) });
-        assert_eq!(assets[2], AcceptedAsset { code: "EURC".into(), issuer: Some("GISSUER2".into()) });
+        assert_eq!(
+            assets[0],
+            AcceptedAsset {
+                code: "XLM".into(),
+                issuer: None
+            }
+        );
+        assert_eq!(
+            assets[1],
+            AcceptedAsset {
+                code: "USDC".into(),
+                issuer: Some("GISSUER".into())
+            }
+        );
+        assert_eq!(
+            assets[2],
+            AcceptedAsset {
+                code: "EURC".into(),
+                issuer: Some("GISSUER2".into())
+            }
+        );
     }
 }
 
