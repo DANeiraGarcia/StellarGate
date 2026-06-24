@@ -1,9 +1,14 @@
 use anyhow::Result;
-use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
+use std::net::SocketAddr;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
-use stellargate::{api, config::Config, db, expiry, horizon, AppState};
+use stellargate::{
+    api,
+    config::{Config, ListenerMode},
+    db, expiry, horizon, AppState,
+};
 use tokio::sync::watch;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
@@ -18,7 +23,14 @@ async fn main() -> Result<()> {
     let cfg = Config::from_env()?;
 
     let pool = SqlitePoolOptions::new()
-        .connect_with(SqliteConnectOptions::from_str(&cfg.database_url)?.create_if_missing(true))
+        .max_connections(cfg.db_pool_max_connections)
+        .connect_with(
+            SqliteConnectOptions::from_str(&cfg.database_url)?
+                .create_if_missing(true)
+                .journal_mode(SqliteJournalMode::Wal)
+                .synchronous(SqliteSynchronous::Normal)
+                .busy_timeout(Duration::from_millis(cfg.db_busy_timeout_ms)),
+        )
         .await?;
     db::migrate(&pool).await?;
 
@@ -54,9 +66,12 @@ async fn main() -> Result<()> {
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     info!("StellarGate API listening on {addr}");
 
-    axum::serve(listener, api::router(state))
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    axum::serve(
+        listener,
+        api::router(state).into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await?;
 
     // Signal background tasks and wait (bounded) for them to finish.
     let _ = shutdown_tx.send(true);

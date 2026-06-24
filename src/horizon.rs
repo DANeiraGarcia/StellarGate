@@ -92,18 +92,42 @@ struct Embedded {
 #[derive(Debug, PartialEq, Eq)]
 pub enum Verdict {
     /// Cumulative paid amount equals the requested amount exactly.
-    Completed { tx_hash: String, paid_amount: String },
+    Completed {
+        tx_hash: String,
+        paid_amount: String,
+    },
     /// Cumulative paid amount exceeds the requested amount.
     /// The intent is fulfilled; `delta` is the excess the merchant should refund.
-    Overpaid { tx_hash: String, paid_amount: String },
+    Overpaid {
+        tx_hash: String,
+        paid_amount: String,
+    },
     /// Cumulative paid amount is still below the requested amount.
     /// The intent remains open; `delta` is the shortfall still owed.
-    Underpaid { tx_hash: String, paid_amount: String },
+    Underpaid {
+        tx_hash: String,
+        paid_amount: String,
+    },
 }
 
 impl HorizonPayment {
+    /// The transaction's memo, but only when Horizon reports it as `memo_type:
+    /// "text"`.
+    ///
+    /// We generate text memos exclusively (see [`crate::api::payments`]).
+    /// Stellar transactions can instead carry a `memo_id` (u64) or
+    /// `memo_hash`/`memo_return` (32-byte) memo, and Horizon still populates
+    /// the JSON `memo` field for those — as a decimal string or base64,
+    /// respectively. A `memo_id` consisting only of digits could coincide
+    /// with one of our hex memos as plain text, so the type must be checked;
+    /// otherwise an unrelated `memo_id` payment could be mistaken for one of
+    /// ours.
     fn memo(&self) -> Option<&str> {
-        self.transaction.as_ref().and_then(|t| t.memo.as_deref())
+        let t = self.transaction.as_ref()?;
+        if t.memo_type.as_deref() != Some("text") {
+            return None;
+        }
+        t.memo.as_deref()
     }
 }
 
@@ -155,9 +179,18 @@ pub fn verify(
 
     use std::cmp::Ordering;
     match total_paid.cmp(&expected) {
-        Ordering::Equal => Some(Verdict::Completed { tx_hash, paid_amount }),
-        Ordering::Greater => Some(Verdict::Overpaid { tx_hash, paid_amount }),
-        Ordering::Less => Some(Verdict::Underpaid { tx_hash, paid_amount }),
+        Ordering::Equal => Some(Verdict::Completed {
+            tx_hash,
+            paid_amount,
+        }),
+        Ordering::Greater => Some(Verdict::Overpaid {
+            tx_hash,
+            paid_amount,
+        }),
+        Ordering::Less => Some(Verdict::Underpaid {
+            tx_hash,
+            paid_amount,
+        }),
     }
 }
 
@@ -223,7 +256,12 @@ async fn starting_cursor(state: &Arc<AppState>) -> anyhow::Result<String> {
         .json()
         .await?;
 
-    match page.embedded.records.first().and_then(|p| p.paging_token.clone()) {
+    match page
+        .embedded
+        .records
+        .first()
+        .and_then(|p| p.paging_token.clone())
+    {
         Some(token) => {
             // Persist immediately so a crash before the first page still leaves
             // us baselined rather than replaying history next time.
@@ -308,22 +346,54 @@ async fn reconcile_payment(state: &Arc<AppState>, hp: &HorizonPayment) -> anyhow
         .and_then(money::parse_stroops)
         .unwrap_or(0);
 
-    match verify(&payment, hp, &state.config.accepted_assets, already_paid_stroops) {
-        Some(Verdict::Completed { tx_hash, paid_amount }) => {
-            settle(state, &payment, "completed", &tx_hash, &paid_amount, "payment.completed", None).await;
+    match verify(
+        &payment,
+        hp,
+        &state.config.accepted_assets,
+        already_paid_stroops,
+    ) {
+        Some(Verdict::Completed {
+            tx_hash,
+            paid_amount,
+        }) => {
+            settle(
+                state,
+                &payment,
+                "completed",
+                &tx_hash,
+                &paid_amount,
+                "payment.completed",
+                None,
+            )
+            .await;
             Ok(true)
         }
-        Some(Verdict::Overpaid { tx_hash, paid_amount }) => {
+        Some(Verdict::Overpaid {
+            tx_hash,
+            paid_amount,
+        }) => {
             let delta = delta_str(&paid_amount, &payment.amount);
             info!(
                 payment_id = %payment.id,
                 excess = %delta.as_deref().unwrap_or("?"),
                 "overpayment — intent completed, excess should be refunded"
             );
-            settle(state, &payment, "completed", &tx_hash, &paid_amount, "payment.overpaid", delta.as_deref()).await;
+            settle(
+                state,
+                &payment,
+                "completed",
+                &tx_hash,
+                &paid_amount,
+                "payment.overpaid",
+                delta.as_deref(),
+            )
+            .await;
             Ok(true)
         }
-        Some(Verdict::Underpaid { tx_hash, paid_amount }) => {
+        Some(Verdict::Underpaid {
+            tx_hash,
+            paid_amount,
+        }) => {
             let delta = delta_str(&payment.amount, &paid_amount);
             warn!(
                 payment_id = %payment.id,
@@ -332,7 +402,16 @@ async fn reconcile_payment(state: &Arc<AppState>, hp: &HorizonPayment) -> anyhow
                 remaining = %delta.as_deref().unwrap_or("?"),
                 "underpayment — intent remains open for a top-up"
             );
-            settle(state, &payment, "underpaid", &tx_hash, &paid_amount, "payment.underpaid", delta.as_deref()).await;
+            settle(
+                state,
+                &payment,
+                "underpaid",
+                &tx_hash,
+                &paid_amount,
+                "payment.underpaid",
+                delta.as_deref(),
+            )
+            .await;
             Ok(true)
         }
         None => Ok(false),
@@ -362,6 +441,8 @@ async fn settle(
     settled.status = status.to_string();
     settled.tx_hash = Some(tx_hash.to_string());
     settled.paid_amount = Some(paid_amount.to_string());
+    // Webhook delivery is handled asynchronously by the webhook subsystem
+    // (recording here is non-blocking from reconciliation's point of view).
     webhook::dispatch(state, &settled, event, delta).await;
 }
 
@@ -612,14 +693,16 @@ mod tests {
         }
     }
 
-    const USDC_ISSUER: &str = "GUSDC";
+    fn test_assets() -> Vec<crate::config::AcceptedAsset> {
+        crate::config::AcceptedAsset::parse_list("XLM,USDC:GUSDC")
+    }
 
     #[test]
     fn exact_xlm_payment_completes() {
         let p = pending("XLM", "10.00");
         let hp = native_payment("10.0000000", "MEMO1234", "GGATEWAY");
         assert_eq!(
-            verify(&p, &hp, USDC_ISSUER, 0),
+            verify(&p, &hp, &test_assets(), 0),
             Some(Verdict::Completed {
                 tx_hash: "TXHASH".into(),
                 paid_amount: "10".into(),
@@ -632,7 +715,7 @@ mod tests {
         let p = pending("XLM", "10");
         let hp = native_payment("12.5", "MEMO1234", "GGATEWAY");
         assert_eq!(
-            verify(&p, &hp, USDC_ISSUER, 0),
+            verify(&p, &hp, &test_assets(), 0),
             Some(Verdict::Overpaid {
                 tx_hash: "TXHASH".into(),
                 paid_amount: "12.5".into(),
@@ -645,7 +728,7 @@ mod tests {
         let p = pending("XLM", "10");
         let hp = native_payment("9.9999999", "MEMO1234", "GGATEWAY");
         assert_eq!(
-            verify(&p, &hp, USDC_ISSUER, 0),
+            verify(&p, &hp, &test_assets(), 0),
             Some(Verdict::Underpaid {
                 tx_hash: "TXHASH".into(),
                 paid_amount: "9.9999999".into(),
@@ -659,14 +742,14 @@ mod tests {
         let p = pending("XLM", "5");
         let hp1 = native_payment("3.0000000", "MEMO1234", "GGATEWAY");
         assert!(matches!(
-            verify(&p, &hp1, USDC_ISSUER, 0),
+            verify(&p, &hp1, &test_assets(), 0),
             Some(Verdict::Underpaid { .. })
         ));
 
         // Top-up: 2 XLM arrives; cumulative = 5 = expected — completes exactly.
         let hp2 = native_payment("2.0000000", "MEMO1234", "GGATEWAY");
         assert_eq!(
-            verify(&p, &hp2, USDC_ISSUER, 30_000_000),
+            verify(&p, &hp2, &test_assets(), 30_000_000),
             Some(Verdict::Completed {
                 tx_hash: "TXHASH".into(),
                 paid_amount: "5".into(),
@@ -681,7 +764,7 @@ mod tests {
         // Top-up of 3 XLM; cumulative = 6 > 5 — overpaid.
         let hp = native_payment("3.0000000", "MEMO1234", "GGATEWAY");
         assert_eq!(
-            verify(&p, &hp, USDC_ISSUER, 30_000_000),
+            verify(&p, &hp, &test_assets(), 30_000_000),
             Some(Verdict::Overpaid {
                 tx_hash: "TXHASH".into(),
                 paid_amount: "6".into(),
@@ -693,14 +776,33 @@ mod tests {
     fn wrong_memo_is_ignored() {
         let p = pending("XLM", "10");
         let hp = native_payment("10", "OTHER", "GGATEWAY");
-        assert_eq!(verify(&p, &hp, USDC_ISSUER, 0), None);
+        assert_eq!(verify(&p, &hp, &test_assets(), 0), None);
+    }
+
+    /// A `memo_id`/`memo_hash`/`memo_return` transaction that happens to
+    /// render the same characters as one of our hex memos must never be
+    /// mistaken for a match — only `memo_type: "text"` counts.
+    #[test]
+    fn non_text_memo_type_is_ignored_even_if_value_matches() {
+        let p = pending("XLM", "10");
+        let mut hp = native_payment("10", "MEMO1234", "GGATEWAY");
+        hp.transaction.as_mut().unwrap().memo_type = Some("id".into());
+        assert_eq!(verify(&p, &hp, &test_assets(), 0), None);
+    }
+
+    #[test]
+    fn missing_memo_type_is_ignored() {
+        let p = pending("XLM", "10");
+        let mut hp = native_payment("10", "MEMO1234", "GGATEWAY");
+        hp.transaction.as_mut().unwrap().memo_type = None;
+        assert_eq!(verify(&p, &hp, &test_assets(), 0), None);
     }
 
     #[test]
     fn wrong_destination_is_ignored() {
         let p = pending("XLM", "10");
         let hp = native_payment("10", "MEMO1234", "GSOMEONEELSE");
-        assert_eq!(verify(&p, &hp, USDC_ISSUER, 0), None);
+        assert_eq!(verify(&p, &hp, &test_assets(), 0), None);
     }
 
     #[test]
@@ -709,8 +811,8 @@ mod tests {
         let mut hp = native_payment("10", "MEMO1234", "GGATEWAY");
         hp.asset_type = Some("credit_alphanum4".into());
         hp.asset_code = Some("USDC".into());
-        hp.asset_issuer = Some(USDC_ISSUER.into());
-        assert_eq!(verify(&p, &hp, USDC_ISSUER, 0), None);
+        hp.asset_issuer = Some("GUSDC".into());
+        assert_eq!(verify(&p, &hp, &test_assets(), 0), None);
     }
 
     #[test]
@@ -721,7 +823,7 @@ mod tests {
             amount: Some("5.0".into()),
             asset_type: Some("credit_alphanum4".into()),
             asset_code: Some("USDC".into()),
-            asset_issuer: Some(USDC_ISSUER.into()),
+            asset_issuer: Some("GUSDC".into()),
             to: Some("GGATEWAY".into()),
             transaction_hash: Some("TXHASH".into()),
             transaction: Some(TransactionRef {
@@ -731,7 +833,7 @@ mod tests {
             paging_token: Some("1".into()),
         };
         assert!(matches!(
-            verify(&p, &hp, USDC_ISSUER, 0),
+            verify(&p, &hp, &test_assets(), 0),
             Some(Verdict::Completed { .. })
         ));
     }
@@ -753,10 +855,10 @@ mod tests {
             }),
             paging_token: Some("1".into()),
         };
-        assert_eq!(verify(&p, &hp, USDC_ISSUER, 0), None);
+        assert_eq!(verify(&p, &hp, &test_assets(), 0), None);
         // Sanity: with the right issuer it would have matched.
-        hp.asset_issuer = Some(USDC_ISSUER.into());
-        assert!(verify(&p, &hp, USDC_ISSUER, 0).is_some());
+        hp.asset_issuer = Some("GUSDC".into());
+        assert!(verify(&p, &hp, &test_assets(), 0).is_some());
     }
 
     #[test]
@@ -764,7 +866,7 @@ mod tests {
         let p = pending("XLM", "10");
         let mut hp = native_payment("10", "MEMO1234", "GGATEWAY");
         hp.kind = "create_account".into();
-        assert_eq!(verify(&p, &hp, USDC_ISSUER, 0), None);
+        assert_eq!(verify(&p, &hp, &test_assets(), 0), None);
     }
 
     #[test]
@@ -808,7 +910,7 @@ mod tests {
         let hp: HorizonPayment = serde_json::from_str(data).unwrap();
         let p = pending("XLM", "10.00");
         assert!(matches!(
-            verify(&p, &hp, USDC_ISSUER),
+            verify(&p, &hp, &test_assets(), 0),
             Some(Verdict::Completed { .. })
         ));
     }
