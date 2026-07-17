@@ -102,6 +102,11 @@ pub struct Config {
     /// Required when `STELLAR_NETWORK=public`; optional (falls back to permissive) on testnet.
     pub cors_allowed_origins: Vec<String>,
     pub listener_mode: ListenerMode,
+    /// Bypasses the SSRF guard's loopback/link-local/private/reserved IP check
+    /// on `webhook_url` (the DNS resolution and http(s)-scheme check still
+    /// run). Only for local development and tests that target a loopback mock
+    /// server — never enable this in production.
+    pub webhook_allow_private_targets: bool,
 }
 
 impl Config {
@@ -139,6 +144,7 @@ impl Config {
             listener_mode: ListenerMode::parse(
                 &std::env::var("STELLAR_LISTENER_MODE").unwrap_or_default(),
             ),
+            webhook_allow_private_targets: parse_env("WEBHOOK_ALLOW_PRIVATE_TARGETS", false),
         };
         config.validate_addresses()?;
         Ok(config)
@@ -201,6 +207,10 @@ impl std::fmt::Debug for Config {
             .field("db_busy_timeout_ms", &self.db_busy_timeout_ms)
             .field("cors_allowed_origins", &self.cors_allowed_origins)
             .field("listener_mode", &self.listener_mode)
+            .field(
+                "webhook_allow_private_targets",
+                &self.webhook_allow_private_targets,
+            )
             .finish()
     }
 }
@@ -248,6 +258,7 @@ mod tests {
             db_busy_timeout_ms: 5000,
             cors_allowed_origins: vec![],
             listener_mode: ListenerMode::Stream,
+            webhook_allow_private_targets: false,
         };
         let output = format!("{cfg:?}");
         assert!(
@@ -310,6 +321,7 @@ mod tests {
             db_busy_timeout_ms: 5000,
             cors_allowed_origins: vec![],
             listener_mode: ListenerMode::Stream,
+            webhook_allow_private_targets: false,
         }
     }
 

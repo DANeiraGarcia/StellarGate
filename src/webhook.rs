@@ -105,12 +105,20 @@ pub async fn dispatch(state: &AppState, payment: &db::Payment, event: &str, delt
         warn!(error = %e, "failed to record webhook delivery");
     }
 
+    let client = match safe_client(state, &url).await {
+        Ok(c) => c,
+        Err(e) => {
+            warn!(payment_id = %payment.id, %url, error = %e, "webhook blocked by SSRF guard");
+            let _ = db::update_webhook_delivery(&state.pool, &delivery_id, "failed", 0).await;
+            return;
+        }
+    };
+
     let attempts = state.config.webhook_retry_attempts.max(1);
     let delay = Duration::from_millis(state.config.webhook_retry_delay_ms);
 
     for attempt in 1..=attempts {
-        let result = state
-            .http
+        let result = client
             .post(&url)
             .header("Content-Type", "application/json")
             .header("X-StellarGate-Signature", &signature)
@@ -147,6 +155,14 @@ pub async fn dispatch(state: &AppState, payment: &db::Payment, event: &str, delt
 
     warn!(payment_id = %payment.id, %url, "webhook delivery exhausted all retries");
     let _ = db::update_webhook_delivery(&state.pool, &delivery_id, "failed", attempts as i64).await;
+}
+
+/// Resolve and SSRF-check `url`, returning a client pinned to the validated
+/// address. Honors `webhook_allow_private_targets` for local dev/tests that
+/// intentionally target a loopback mock server.
+pub(crate) async fn safe_client(state: &AppState, url: &str) -> anyhow::Result<reqwest::Client> {
+    let target = crate::ssrf::validate(url, state.config.webhook_allow_private_targets).await?;
+    Ok(crate::ssrf::pinned_client(&target)?)
 }
 
 #[cfg(test)]

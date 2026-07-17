@@ -76,6 +76,7 @@ cp .env.example .env
 | `WEBHOOK_SECRET` | HMAC signing secret for webhooks | — |
 | `WEBHOOK_RETRY_ATTEMPTS` | Webhook delivery attempts | `3` |
 | `WEBHOOK_RETRY_DELAY_MS` | Delay between webhook retries | `5000` |
+| `WEBHOOK_ALLOW_PRIVATE_TARGETS` | Bypasses the SSRF guard's loopback/link-local/private/reserved IP check on `webhook_url` (still requires http(s) and a resolvable host). For local development and tests only — never enable in production. | `false` |
 | `CORS_ALLOWED_ORIGINS` | Comma-separated allowed CORS origins (e.g. `https://app.example.com`). Required on `public` network; omitting on testnet falls back to permissive with a warning. | _(unset — permissive on testnet)_ |
 | `RATE_LIMIT_REQUESTS_PER_SEC` | Rate limit for `POST /payments` (requests per second per IP) | `10` |
 | `DB_POOL_MAX_CONNECTIONS` | SQLite connection pool size. WAL mode allows one writer + many concurrent readers. | `10` |
@@ -149,6 +150,13 @@ Create a new payment intent.
 | `asset` | string | ✅ | `XLM` or `USDC` |
 | `merchant_id` | string | ❌ | Any string |
 | `webhook_url` | string | ❌ | Valid HTTPS URL |
+
+> `webhook_url` is checked against an SSRF guard: its host is resolved and
+> rejected if it's loopback, link-local (including the cloud metadata address
+> `169.254.169.254`), private, or otherwise reserved. The same check runs
+> again on every redelivery (`POST /payments/:id/webhooks/:delivery_id/redeliver`)
+> against the exact address resolved, not a second DNS lookup, so a
+> DNS-rebinding attempt after the initial check can't reach an internal host.
 
 **Headers**
 

@@ -127,10 +127,14 @@ pub async fn create(
         ));
     }
     if let Some(url) = &body.webhook_url {
-        if !(url.starts_with("http://") || url.starts_with("https://")) {
+        if crate::ssrf::validate(url, state.config.webhook_allow_private_targets)
+            .await
+            .is_err()
+        {
             return Err(AppError::bad_request(
                 "invalid_webhook_url",
-                "webhook_url must be an http(s) URL",
+                "webhook_url must be a reachable http(s) URL that does not resolve to a \
+                 loopback, link-local, private, or other reserved address",
             ));
         }
     }
@@ -412,14 +416,26 @@ pub async fn redeliver_webhook(
         ));
     }
 
+    // Re-validate the target on every redelivery — the delivery row may be old,
+    // and this endpoint is unauthenticated, so a stale-but-once-valid URL must
+    // not become a standing SSRF pivot.
+    let client = crate::webhook::safe_client(&state, &delivery.url)
+        .await
+        .map_err(|_| {
+            AppError::new(
+                StatusCode::BAD_REQUEST,
+                "webhook_target_blocked",
+                "webhook target is not allowed",
+            )
+        })?;
+
     // Re-send the original payload, re-signed with a fresh timestamp so the
     // receiver's replay-tolerance window is measured from this redelivery.
     let payload_bytes = delivery.payload.as_bytes();
     let timestamp = crate::webhook::current_timestamp();
     let signature = crate::webhook::sign(&state.config.webhook_secret, timestamp, payload_bytes);
 
-    let result = state
-        .http
+    let result = client
         .post(&delivery.url)
         .header("Content-Type", "application/json")
         .header("X-StellarGate-Signature", &signature)

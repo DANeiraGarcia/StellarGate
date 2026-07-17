@@ -34,6 +34,7 @@ fn make_config(rate_limit_requests_per_sec: u32) -> Config {
         db_busy_timeout_ms: 5000,
         cors_allowed_origins: vec![],
         listener_mode: ListenerMode::Poll,
+        webhook_allow_private_targets: false,
     }
 }
 
