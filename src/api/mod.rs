@@ -67,6 +67,7 @@ pub fn router(state: Arc<AppState>) -> axum::Router {
             poll or inspect). */
             let authed = axum::Router::new()
                 .route("/", post(payments::create).get(payments::list))
+                .route("/:id/webhooks", get(payments::list_webhooks))
                 .route_layer(middleware::from_fn_with_state(
                     state.clone(),
                     auth_middleware,
@@ -75,7 +76,6 @@ pub fn router(state: Arc<AppState>) -> axum::Router {
             axum::Router::new()
                 .merge(authed)
                 .route("/:id", get(payments::get_by_id))
-                .route("/:id/webhooks", get(payments::list_webhooks))
                 .route(
                     "/:id/webhooks/:delivery_id/redeliver",
                     post(payments::redeliver_webhook),
