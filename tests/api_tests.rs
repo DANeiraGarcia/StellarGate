@@ -32,6 +32,7 @@ fn make_config() -> Config {
         db_busy_timeout_ms: 5000,
         cors_allowed_origins: vec![],
         listener_mode: ListenerMode::Poll,
+        webhook_allow_private_targets: false,
         admin_provisioning_secret: TEST_ADMIN_SECRET.into(),
     }
 }
@@ -567,9 +568,9 @@ async fn test_reject_webhook_url_targeting_link_local_metadata_address() {
     assert_eq!(res.json::<Value>()["code"], "invalid_webhook_url");
 }
 
-/// A delivery row can predate this guard (or be forged some other way); the
-/// redeliver endpoint is unauthenticated, so it must re-validate the target on
-/// every call rather than trusting whatever URL was stored.
+/// A delivery row can predate this guard (or be forged some other way), so the
+/// redeliver endpoint must re-validate the target on every call rather than
+/// trusting whatever URL was stored — merchant auth alone is not enough.
 #[tokio::test]
 async fn test_redeliver_rejects_ssrf_target_even_for_a_stored_delivery() {
     let (server, pool) = test_server_with_pool().await;
@@ -596,6 +597,7 @@ async fn test_redeliver_rejects_ssrf_target_even_for_a_stored_delivery() {
 
     let res = server
         .post(&format!("/payments/{id}/webhooks/delivery-ssrf/redeliver"))
+        .add_header("Authorization", format!("Bearer {key}"))
         .await;
     res.assert_status(StatusCode::BAD_REQUEST);
     assert_eq!(res.json::<Value>()["code"], "webhook_target_blocked");
@@ -959,7 +961,7 @@ async fn test_webhook_delivery_isolation() {
     // List webhooks for payment 2 should be empty
     let res2 = server
         .get(&format!("/payments/{id2}/webhooks"))
-        .add_header("Authorization", auth)
+        .add_header("Authorization", auth.clone())
         .await;
     res2.assert_status_ok();
     assert_eq!(

@@ -34,13 +34,14 @@ fn make_config(rate_limit_requests_per_sec: u32) -> Config {
         db_busy_timeout_ms: 5000,
         cors_allowed_origins: vec![],
         listener_mode: ListenerMode::Poll,
+        webhook_allow_private_targets: false,
         admin_provisioning_secret: TEST_ADMIN_SECRET.into(),
     }
 }
 
 const TEST_ADMIN_SECRET: &str = "test-admin-secret";
 
-async fn server_with_config(cfg: Config) -> TestServer {
+async fn server_with_config(cfg: Config) -> (TestServer, db::Db) {
     let pool = SqlitePoolOptions::new()
         .connect_with(
             SqliteConnectOptions::from_str(&cfg.database_url)
