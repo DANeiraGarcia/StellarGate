@@ -144,6 +144,21 @@ pub async fn create(
                 "webhook_url must be an HTTP or HTTPS URL",
             ));
         }
+
+        /* Resolve the host and reject loopback/link-local/private/reserved
+        addresses so a webhook_url can't be used to probe the internal network
+        (the same guard runs again, against the pinned address, on every
+        dispatch and redelivery). */
+        if crate::ssrf::validate(url, state.config.webhook_allow_private_targets)
+            .await
+            .is_err()
+        {
+            return Err(AppError::bad_request(
+                "invalid_webhook_url",
+                "webhook_url must be a reachable http(s) URL that does not resolve to a \
+                 loopback, link-local, private, or other reserved address",
+            ));
+        }
     }
 
     /* An optional Idempotency-Key lets a client safely retry a create after a
@@ -429,6 +444,18 @@ pub async fn redeliver_webhook(
             "delivery not found",
         ));
     }
+
+    // Re-validate the target on every redelivery — the delivery row may be old,
+    // so a stale-but-once-valid URL must not become a standing SSRF pivot.
+    let client = crate::webhook::safe_client(&state, &delivery.url)
+        .await
+        .map_err(|_| {
+            AppError::new(
+                StatusCode::BAD_REQUEST,
+                "webhook_target_blocked",
+                "webhook target is not allowed",
+            )
+        })?;
 
     /* Re-send the original payload, re-signed with a fresh timestamp so the
     receiver's replay-tolerance window is measured from this redelivery. */

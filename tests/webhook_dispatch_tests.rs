@@ -31,6 +31,9 @@ fn make_config(webhook_secret: &str, retry_attempts: u32) -> Config {
         payment_ttl_secs: 3600,
         cors_allowed_origins: vec![],
         listener_mode: ListenerMode::Poll,
+        // These tests dispatch to a wiremock server on 127.0.0.1, which the
+        // SSRF guard would otherwise block.
+        webhook_allow_private_targets: true,
         rate_limit_requests_per_sec: 1000,
         db_pool_max_connections: 10,
         db_busy_timeout_ms: 5000,
