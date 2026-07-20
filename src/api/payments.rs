@@ -429,8 +429,7 @@ pub async fn redeliver_webhook(
     let timestamp = crate::webhook::current_timestamp();
     let signature = crate::webhook::sign(&state.config.webhook_secret, timestamp, payload_bytes);
 
-    let result = state
-        .http
+    let result = client
         .post(&delivery.url)
         .header("Content-Type", "application/json")
         .header("X-StellarGate-Signature", &signature)

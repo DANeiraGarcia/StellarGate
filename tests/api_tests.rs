@@ -534,6 +534,74 @@ async fn test_webhook_url_invalid_rejected() {
 }
 
 #[tokio::test]
+async fn test_reject_webhook_url_targeting_loopback() {
+    let server = test_server().await;
+    let key = provision_merchant(&server).await;
+    let res = server
+        .post("/payments")
+        .add_header("Authorization", format!("Bearer {key}"))
+        .json(&json!({ "amount": "1", "asset": "XLM", "webhook_url": "http://127.0.0.1:9/hook" }))
+        .await;
+    res.assert_status(StatusCode::BAD_REQUEST);
+    assert_eq!(
+        res.json::<Value>()["code"],
+        "invalid_webhook_url",
+        "loopback webhook targets must be rejected at creation"
+    );
+}
+
+#[tokio::test]
+async fn test_reject_webhook_url_targeting_link_local_metadata_address() {
+    let server = test_server().await;
+    let key = provision_merchant(&server).await;
+    let res = server
+        .post("/payments")
+        .add_header("Authorization", format!("Bearer {key}"))
+        .json(&json!({
+            "amount": "1",
+            "asset": "XLM",
+            "webhook_url": "http://169.254.169.254/latest/meta-data/"
+        }))
+        .await;
+    res.assert_status(StatusCode::BAD_REQUEST);
+    assert_eq!(res.json::<Value>()["code"], "invalid_webhook_url");
+}
+
+/// A delivery row can predate this guard (or be forged some other way); the
+/// redeliver endpoint is unauthenticated, so it must re-validate the target on
+/// every call rather than trusting whatever URL was stored.
+#[tokio::test]
+async fn test_redeliver_rejects_ssrf_target_even_for_a_stored_delivery() {
+    let (server, pool) = test_server_with_pool().await;
+    let key = provision_merchant(&server).await;
+    let id = server
+        .post("/payments")
+        .add_header("Authorization", format!("Bearer {key}"))
+        .json(&json!({ "amount": "5", "asset": "XLM" }))
+        .await
+        .json::<Value>()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    stellargate::db::save_webhook_delivery(
+        &pool,
+        "delivery-ssrf",
+        &id,
+        "http://127.0.0.1:9/hook",
+        r#"{"event":"payment.completed"}"#,
+    )
+    .await
+    .unwrap();
+
+    let res = server
+        .post(&format!("/payments/{id}/webhooks/delivery-ssrf/redeliver"))
+        .await;
+    res.assert_status(StatusCode::BAD_REQUEST);
+    assert_eq!(res.json::<Value>()["code"], "webhook_target_blocked");
+}
+
+#[tokio::test]
 async fn test_list_payments() {
     let server = test_server().await;
     let key = provision_merchant(&server).await;
