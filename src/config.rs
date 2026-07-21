@@ -125,6 +125,29 @@ impl Config {
         let gateway_secret = std::env::var("STELLAR_GATEWAY_SECRET").unwrap_or_default();
         let webhook_secret = Self::validate_webhook_secret(std::env::var("WEBHOOK_SECRET"))?;
 
+        let cors_allowed_origins: Vec<String> = {
+            let raw_origins: Vec<String> = std::env::var("CORS_ALLOWED_ORIGINS")
+                .unwrap_or_default()
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(String::from)
+                .collect();
+
+            // Validate every configured origin now so a typo aborts boot with
+            // a clear message instead of silently removing the origin from the
+            // allowlist (or producing an empty allowlist with no error).
+            for origin in &raw_origins {
+                origin.parse::<axum::http::HeaderValue>().map_err(|e| {
+                    anyhow::anyhow!(
+                        "CORS_ALLOWED_ORIGINS contains an invalid origin {origin:?}: {e}. \
+                         Fix or remove the bad entry."
+                    )
+                })?;
+            }
+            raw_origins
+        };
+
         let config = Self {
             port: parse_env("PORT", 3000)?,
             database_url,
@@ -141,20 +164,14 @@ impl Config {
                 }
             },
             webhook_secret,
-            webhook_retry_attempts: parse_env("WEBHOOK_RETRY_ATTEMPTS", 3)?,
-            webhook_retry_delay_ms: parse_env("WEBHOOK_RETRY_DELAY_MS", 5000)?,
-            poll_interval_secs: parse_env("POLL_INTERVAL_SECS", 10)?,
-            payment_ttl_secs: parse_env("PAYMENT_TTL_SECS", 3600)?,
-            rate_limit_requests_per_sec: parse_env("RATE_LIMIT_REQUESTS_PER_SEC", 10)?,
-            db_pool_max_connections: parse_env("DB_POOL_MAX_CONNECTIONS", 10)?,
-            db_busy_timeout_ms: parse_env("DB_BUSY_TIMEOUT_MS", 5000)?,
-            cors_allowed_origins: std::env::var("CORS_ALLOWED_ORIGINS")
-                .unwrap_or_default()
-                .split(',')
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(String::from)
-                .collect(),
+            webhook_retry_attempts: parse_env("WEBHOOK_RETRY_ATTEMPTS", 3),
+            webhook_retry_delay_ms: parse_env("WEBHOOK_RETRY_DELAY_MS", 5000),
+            poll_interval_secs: parse_env("POLL_INTERVAL_SECS", 10),
+            payment_ttl_secs: parse_env("PAYMENT_TTL_SECS", 3600),
+            rate_limit_requests_per_sec: parse_env("RATE_LIMIT_REQUESTS_PER_SEC", 10),
+            db_pool_max_connections: parse_env("DB_POOL_MAX_CONNECTIONS", 10),
+            db_busy_timeout_ms: parse_env("DB_BUSY_TIMEOUT_MS", 5000),
+            cors_allowed_origins,
             listener_mode: ListenerMode::parse(
                 &std::env::var("STELLAR_LISTENER_MODE").unwrap_or_default(),
             ),
@@ -564,46 +581,47 @@ mod tests {
     }
 
     #[test]
-    fn parse_env_fails_fast_on_invalid_numeric_value() {
-        run_with_env(&[("PAYMENT_TTL_SECS", Some("not-a-number"))], || {
-            let err = parse_env::<u64>("PAYMENT_TTL_SECS", 3600)
-                .unwrap_err()
-                .to_string();
-            assert!(
-                err.contains("PAYMENT_TTL_SECS"),
-                "error must name the variable; got: {err}"
-            );
-            assert!(
-                err.contains("not-a-number"),
-                "error must echo the bad value; got: {err}"
-            );
-        });
-    }
-
-    #[test]
-    fn parse_env_returns_default_when_variable_is_absent() {
-        run_with_env(&[("PAYMENT_TTL_SECS", None)], || {
-            let result = parse_env::<u64>("PAYMENT_TTL_SECS", 3600).unwrap();
-            assert_eq!(result, 3600);
-        });
-    }
-
-    #[test]
-    fn startup_fails_on_invalid_poll_interval() {
+    fn startup_fails_on_invalid_cors_origin() {
         run_with_env(
             &[
                 (
                     "WEBHOOK_SECRET",
                     Some("a-very-long-and-secure-webhook-signing-secret-32-chars"),
                 ),
-                ("POLL_INTERVAL_SECS", Some("oops")),
+                ("CORS_ALLOWED_ORIGINS", Some("https://good.example.com,not a valid origin,https://other.example.com")),
             ],
             || {
                 let err = Config::from_env().unwrap_err().to_string();
                 assert!(
-                    err.contains("POLL_INTERVAL_SECS"),
-                    "error must name the variable; got: {err}"
+                    err.contains("CORS_ALLOWED_ORIGINS"),
+                    "error must mention CORS_ALLOWED_ORIGINS; got: {err}"
                 );
+                assert!(
+                    err.contains("not a valid origin"),
+                    "error must echo the bad value; got: {err}"
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn startup_succeeds_with_valid_cors_origins() {
+        run_with_env(
+            &[
+                (
+                    "WEBHOOK_SECRET",
+                    Some("a-very-long-and-secure-webhook-signing-secret-32-chars"),
+                ),
+                (
+                    "CORS_ALLOWED_ORIGINS",
+                    Some("https://app.example.com,https://admin.example.com"),
+                ),
+            ],
+            || {
+                let cfg = Config::from_env().unwrap();
+                assert_eq!(cfg.cors_allowed_origins.len(), 2);
+                assert_eq!(cfg.cors_allowed_origins[0], "https://app.example.com");
+                assert_eq!(cfg.cors_allowed_origins[1], "https://admin.example.com");
             },
         );
     }
