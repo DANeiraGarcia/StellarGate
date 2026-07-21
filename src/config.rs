@@ -125,6 +125,29 @@ impl Config {
         let gateway_secret = std::env::var("STELLAR_GATEWAY_SECRET").unwrap_or_default();
         let webhook_secret = Self::validate_webhook_secret(std::env::var("WEBHOOK_SECRET"))?;
 
+        let cors_allowed_origins: Vec<String> = {
+            let raw_origins: Vec<String> = std::env::var("CORS_ALLOWED_ORIGINS")
+                .unwrap_or_default()
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(String::from)
+                .collect();
+
+            // Validate every configured origin now so a typo aborts boot with
+            // a clear message instead of silently removing the origin from the
+            // allowlist (or producing an empty allowlist with no error).
+            for origin in &raw_origins {
+                origin.parse::<axum::http::HeaderValue>().map_err(|e| {
+                    anyhow::anyhow!(
+                        "CORS_ALLOWED_ORIGINS contains an invalid origin {origin:?}: {e}. \
+                         Fix or remove the bad entry."
+                    )
+                })?;
+            }
+            raw_origins
+        };
+
         let config = Self {
             port: parse_env("PORT", 3000),
             database_url,
@@ -148,13 +171,7 @@ impl Config {
             rate_limit_requests_per_sec: parse_env("RATE_LIMIT_REQUESTS_PER_SEC", 10),
             db_pool_max_connections: parse_env("DB_POOL_MAX_CONNECTIONS", 10),
             db_busy_timeout_ms: parse_env("DB_BUSY_TIMEOUT_MS", 5000),
-            cors_allowed_origins: std::env::var("CORS_ALLOWED_ORIGINS")
-                .unwrap_or_default()
-                .split(',')
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(String::from)
-                .collect(),
+            cors_allowed_origins,
             listener_mode: ListenerMode::parse(
                 &std::env::var("STELLAR_LISTENER_MODE").unwrap_or_default(),
             ),
@@ -551,6 +568,52 @@ mod tests {
                     cfg.webhook_secret,
                     "a-very-long-and-secure-webhook-signing-secret-32-chars"
                 );
+            },
+        );
+    }
+
+    #[test]
+    fn startup_fails_on_invalid_cors_origin() {
+        run_with_env(
+            &[
+                (
+                    "WEBHOOK_SECRET",
+                    Some("a-very-long-and-secure-webhook-signing-secret-32-chars"),
+                ),
+                ("CORS_ALLOWED_ORIGINS", Some("https://good.example.com,not a valid origin,https://other.example.com")),
+            ],
+            || {
+                let err = Config::from_env().unwrap_err().to_string();
+                assert!(
+                    err.contains("CORS_ALLOWED_ORIGINS"),
+                    "error must mention CORS_ALLOWED_ORIGINS; got: {err}"
+                );
+                assert!(
+                    err.contains("not a valid origin"),
+                    "error must echo the bad value; got: {err}"
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn startup_succeeds_with_valid_cors_origins() {
+        run_with_env(
+            &[
+                (
+                    "WEBHOOK_SECRET",
+                    Some("a-very-long-and-secure-webhook-signing-secret-32-chars"),
+                ),
+                (
+                    "CORS_ALLOWED_ORIGINS",
+                    Some("https://app.example.com,https://admin.example.com"),
+                ),
+            ],
+            || {
+                let cfg = Config::from_env().unwrap();
+                assert_eq!(cfg.cors_allowed_origins.len(), 2);
+                assert_eq!(cfg.cors_allowed_origins[0], "https://app.example.com");
+                assert_eq!(cfg.cors_allowed_origins[1], "https://admin.example.com");
             },
         );
     }
